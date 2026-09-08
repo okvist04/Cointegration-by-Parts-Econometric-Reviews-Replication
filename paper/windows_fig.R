@@ -1,23 +1,32 @@
+library(ggplot2)
+
 args <- commandArgs(trailingOnly = FALSE)
 here <- dirname(sub("^--file=", "", args[grep("^--file=", args)][1]))
 D <- Sys.getenv("APPLICATION_DATA", file.path(here, "..", "data"))
 G <- Sys.getenv("GRAPHICS", file.path(here, "..", "results", "graphics"))
 dir.create(G, recursive = TRUE, showWarnings = FALSE)
-sl <- read.csv(file.path(D,"CSIRO_Recons_gmsl_yr_2019.csv"), check.names=FALSE)
-tp <- read.csv(file.path(D,"HadCRUT.5.1.0.0.analysis.summary_series.global.annual.csv"), check.names=FALSE)
+YEAR_MIN <- as.integer(Sys.getenv("YEAR_MIN", "1880"))
+YEAR_MAX <- as.integer(Sys.getenv("YEAR_MAX", "2019"))
+
+sl <- read.csv(file.path(D, "CSIRO_Recons_gmsl_yr_2019.csv"), check.names = FALSE)
+tp <- read.csv(file.path(D, "HadCRUT.5.1.0.0.analysis.summary_series.global.annual.csv"), check.names = FALSE)
 sl$year <- floor(sl$Time); tp$year <- floor(tp$Time)
 base <- mean(tp[["Anomaly (deg C)"]][tp$year >= 1850 & tp$year <= 1900])
 tp$anom <- tp[["Anomaly (deg C)"]] - base
-d <- merge(sl[,c("year","GMSL (mm)")], tp[,c("year","anom")], by="year")
-d <- d[d$year >= 1880 & d$year <= 2019,]
-names(d)[2] <- "gmsl"
+combined <- merge(sl[, c("year", "GMSL (mm)")], tp[, c("year", "anom")], by = "year")
+names(combined) <- c("year", "sea_level", "temperature")
+combined <- combined[combined$year >= YEAR_MIN & combined$year <= YEAR_MAX, ]
+combined <- combined[order(combined$year), ]
+
+range_sl   <- range(combined$sea_level, na.rm = TRUE)
+range_temp <- range(combined$temperature, na.rm = TRUE)
+rescale_lin <- function(x, from, to) (x - from[1]) / diff(from) * diff(to) + to[1]
+combined$temperature_scaled <- rescale_lin(combined$temperature, range_temp, range_sl)
 
 # Window read from the actual run_application.R output (headline
 # specification: r0 = 0.15, BIC, temperature on sea level, case ct) --
-# no longer a hardcoded value. Override the specification via the
-# WIN_CASE / WIN_R0 / WIN_CRITERION / WIN_NORM env vars if you want a
-# different row's window shaded instead.
-app_csv <- Sys.getenv("APPLICATION_CSV", file.path(here, "..", "results", "application", "application.csv"))
+# override via env vars for a different row's window.
+app_csv <- Sys.getenv("APPLICATION_CSV", "results/application/application.csv")
 if (!file.exists(app_csv)) {
   stop(sprintf(
     "%s not found -- run calibration/run_application.R first (it writes the GIEG window this figure shades).",
@@ -35,26 +44,26 @@ if (nrow(row) != 1) {
   stop(sprintf("expected exactly one matching GIEG row in %s for case=%s r0=%s criterion=%s normalization=%s, found %d",
                app_csv, WIN_CASE, WIN_R0, WIN_CRITERION, WIN_NORM, nrow(row)))
 }
-win <- c(row$win_start[1], row$win_end[1])
-colS <- "#1b6ca8"; colT <- "#b02418"
+win_start <- row$win_start[1]; win_end <- row$win_end[1]
 
-postscript(file.path(G,"cointegration_windows.eps"), width=8.4, height=4.8,
-           onefile=FALSE, horizontal=FALSE, paper="special", family="Helvetica")
-par(mar=c(4.2,4.4,1.2,4.6), mgp=c(2.6,0.7,0), cex.axis=0.9, las=1, bty="n")
-plot(NA, xlim=range(d$year), ylim=range(d$gmsl), xlab="Year", ylab="Sea level (mm)", axes=FALSE)
-rect(win[1], par("usr")[3], win[2], par("usr")[4], col="grey88", border=NA)
-abline(v=win, lty=2, lwd=1.2)
-abline(h=pretty(d$gmsl), col="grey92", lwd=0.6)
-axis(1); axis(2)
-lines(d$year, d$gmsl, col=colS, lwd=1.6)
-# right axis for temperature
-r <- range(d$anom); u <- par("usr")[3:4]
-sc <- function(z) u[1] + (z - r[1])/diff(r) * diff(u)
-lines(d$year, sc(d$anom), col=colT, lwd=1.6)
-at <- pretty(r); at <- at[at >= r[1] & at <= r[2]]
-axis(4, at=sc(at), labels=format(at, trim=TRUE))
-mtext(expression("Temperature anomaly ("*degree*"C, 1850-1900 baseline)"), side=4, line=3, las=0, cex=1.0)
-legend("topleft", legend=c("Sea level (CSIRO GMSL)","Temperature anomaly (HadCRUT5)"),
-       col=c(colS,colT), lwd=1.6, bty="n", cex=0.85)
-dev.off()
-cat("wrote cointegration_windows.eps, window", win[1], "-", win[2], "\n")
+p_windows <- ggplot() +
+  geom_rect(aes(xmin = win_start, xmax = win_end, ymin = -Inf, ymax = Inf),
+            fill = "grey50", alpha = 0.25) +
+  geom_line(data = combined, aes(x = year, y = sea_level, colour = "Sea level (CSIRO GMSL)")) +
+  geom_line(data = combined, aes(x = year, y = temperature_scaled, colour = "Temperature anomaly (HadCRUT5)")) +
+  geom_vline(xintercept = c(win_start, win_end), linetype = "dashed", colour = "black", linewidth = 0.4) +
+  scale_y_continuous(
+    name = "Sea level (mm)",
+    sec.axis = sec_axis(
+      transform = ~ rescale_lin(., range_sl, range_temp),
+      name = "Temperature anomaly (degC, 1850-1900 baseline)"
+    )
+  ) +
+  scale_colour_manual(name = NULL, values = c("steelblue", "firebrick")) +
+  labs(x = "Year") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(G, "cointegration_windows.eps"), p_windows, device = cairo_ps,
+       width = 8, height = 6, units = "in")
+cat("wrote cointegration_windows.eps, window", win_start, "-", win_end, "\n")
