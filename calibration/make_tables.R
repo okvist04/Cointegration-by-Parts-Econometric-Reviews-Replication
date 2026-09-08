@@ -1,0 +1,187 @@
+# =====================================================================
+# make_tables.R  --  turn the stored minima into the paper's tables.
+#
+#   Rscript make_tables.R
+#
+# Reads every cell written by run_cv_grid.R and produces, in OUTDIR:
+#
+#   quantiles.csv          simulated critical values with bootstrap Monte
+#                          Carlo standard errors
+#   surface_main.csv       response surface at 1/5/10% with coefficient
+#                          standard errors and sigma_hat
+#   surface_ndf.csv        response surfaces at a dense probability grid --
+#                          the numerical distribution function
+#   table41_case-*.tex     LaTeX, N = 1, ready to paste
+#   table42_case-*.tex     LaTeX, all N
+#
+# Environment:
+#   INDIR   [results/cv]     OUTDIR [results/tables]
+#   NBOOT   [1000]           bootstrap draws for the quantile standard errors
+#   NDF_PTS [221]            grid points for the numerical distribution function
+#   CUBIC_T [1.96]           |t| threshold for keeping beta_3
+# =====================================================================
+
+source("R/response_surface.R")
+
+INDIR    <- Sys.getenv("INDIR", "results/cv")
+OUTDIR   <- Sys.getenv("OUTDIR", "results/tables")
+NBOOT    <- as.integer(Sys.getenv("NBOOT", "1000"))
+NDF_PTS  <- as.integer(Sys.getenv("NDF_PTS", "221"))
+CUBIC_T  <- as.numeric(Sys.getenv("CUBIC_T", "1.96"))
+MAIN_PROBS <- c(0.01, 0.05, 0.10)
+TESTS <- c("FIEG", "BIEG", "GIEG")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+# Probability grid for the numerical distribution function: dense in the
+# left tail, where the test lives, thinner in the body.
+ndf_probs <- function(n) {
+  p <- c(
+    seq(0.0001, 0.01, length.out = max(20, n %/% 6)),
+    seq(0.011, 0.20, length.out = max(40, n %/% 3)),
+    seq(0.21, 0.99, length.out = max(40, n %/% 3))
+  )
+  round(unique(p), 5)
+}
+
+load_cells <- function(dir) {
+  files <- list.files(dir, pattern = "\\.rds$", full.names = TRUE)
+  if (length(files) == 0) stop(sprintf("no .rds cells found in %s -- run run_cv_grid.R first", dir))
+  lapply(files, readRDS)
+}
+
+main <- function() {
+  cells <- load_cells(INDIR)
+  cat(sprintf("loaded %d cells from %s\n", length(cells), INDIR))
+
+  probs_ndf <- ndf_probs(NDF_PTS)
+  allprobs <- sort(unique(c(MAIN_PROBS, probs_ndf)))
+
+  # ---- 1. quantiles with Monte Carlo standard errors ---------------
+  q_rows <- list()
+  for (c in cells) {
+    for (tst in TESTS) {
+      v <- c[[tolower(tst)]]
+      v <- v[is.finite(v)]
+      for (p in allprobs) {
+        B <- if (p %in% MAIN_PROBS) NBOOT else 200
+        q_rows[[length(q_rows) + 1]] <- data.frame(
+          case = c$case, T = c$T, N = c$N, test = tst, prob = p,
+          cv = stats::quantile(v, p, names = FALSE, type = 7),
+          mcse = quantile_se(v, p, B = B),
+          n_finite = length(v), min_obs = c$min_obs, nrep = c$nrep, drift = c$drift
+        )
+      }
+    }
+  }
+  q <- do.call(rbind, q_rows)
+  write.csv(q, file.path(OUTDIR, "quantiles.csv"), row.names = FALSE)
+  cat(sprintf("wrote quantiles.csv (%d rows)\n", nrow(q)))
+
+  # ---- 2. response surfaces -----------------------------------------
+  surf_rows <- list()
+  for (case in unique(q$case)) for (N in sort(unique(q$N))) for (tst in TESTS) for (p in allprobs) {
+    sub <- q[q$case == case & q$N == N & q$test == tst & abs(q$prob - p) < 1e-9, ]
+    sub <- sub[order(sub$T), ]
+    if (nrow(sub) < 4) next
+    s <- fit_surface(sub$T, sub$cv, sub$mcse, cubic_t = CUBIC_T)
+    surf_rows[[length(surf_rows) + 1]] <- data.frame(
+      case = case, N = N, test = tst, prob = p,
+      beta_inf = s$beta[1], se_inf = s$se[1],
+      b1 = s$beta[2], se1 = s$se[2], b2 = s$beta[3], se2 = s$se[3],
+      b3 = s$beta[4], se3 = s$se[4], sigma = s$sigma,
+      cubic = s$cubic, nobs = s$nobs, dof = s$dof
+    )
+  }
+  surf <- do.call(rbind, surf_rows)
+  write.csv(surf, file.path(OUTDIR, "surface_ndf.csv"), row.names = FALSE)
+  write.csv(surf[round(surf$prob, 4) %in% MAIN_PROBS, ], file.path(OUTDIR, "surface_main.csv"), row.names = FALSE)
+  cat(sprintf("wrote surface_ndf.csv (%d rows) and surface_main.csv\n", nrow(surf)))
+
+  # ---- 3. fit diagnostics -------------------------------------------
+  main_s <- surf[round(surf$prob, 4) %in% MAIN_PROBS, ]
+  cat("\nresponse surface fit, sigma_hat by test (1 = fits to within simulation noise):\n")
+  for (case in unique(main_s$case)) for (tst in TESTS) {
+    sub <- main_s[main_s$case == case & main_s$test == tst, ]
+    if (nrow(sub) == 0) next
+    cat(sprintf("  case %-2s %-4s  median %.2f   range %.2f - %.2f   cubic kept in %d of %d\n",
+                case, tst, stats::median(sub$sigma, na.rm = TRUE),
+                min(sub$sigma, na.rm = TRUE), max(sub$sigma, na.rm = TRUE),
+                sum(sub$cubic), nrow(sub)))
+  }
+
+  # ---- 4. LaTeX -------------------------------------------------------
+  for (case in unique(q$case)) {
+    # Table 4.1: N = 1, three probabilities, with MC standard errors
+    lines <- c(
+      sprintf("%% generated by make_tables.R -- case %s, N = 1", case),
+      "%% Monte Carlo standard errors in parentheses",
+      paste0("\\begin{tabular}{r", strrep("r", 9), "}"),
+      "\\toprule",
+      " & \\multicolumn{3}{c}{\\textit{FIEG}} & \\multicolumn{3}{c}{\\textit{BIEG}} & \\multicolumn{3}{c}{\\textit{GIEG}} \\\\",
+      "\\cmidrule(lr){2-4}\\cmidrule(lr){5-7}\\cmidrule(lr){8-10}",
+      "$T$ & 1\\% & 5\\% & 10\\% & 1\\% & 5\\% & 10\\% & 1\\% & 5\\% & 10\\% \\\\",
+      "\\midrule"
+    )
+    sub <- q[q$case == case & q$N == 1 & round(q$prob, 4) %in% MAIN_PROBS, ]
+    for (T in sort(unique(sub$T))) {
+      vals <- c(); ses <- c()
+      for (tst in TESTS) for (p in MAIN_PROBS) {
+        r <- sub[sub$T == T & sub$test == tst & abs(sub$prob - p) < 1e-9, ]
+        vals <- c(vals, if (nrow(r) == 0) "" else sprintf("%.3f", r$cv[1]))
+        ses <- c(ses, if (nrow(r) == 0) "" else sprintf("(%.3f)", r$mcse[1]))
+      }
+      lines <- c(lines, paste0(T, " & ", paste(vals, collapse = " & "), " \\\\"),
+                 paste0(" & ", paste(ses, collapse = " & "), " \\\\"))
+    }
+    lines <- c(lines, "\\bottomrule", "\\end{tabular}")
+    writeLines(lines, file.path(OUTDIR, sprintf("table41_case-%s.tex", case)))
+
+    # Table 4.2: response surface coefficients with standard errors
+    lines2 <- c(
+      sprintf("%% generated by make_tables.R -- case %s", case),
+      "%% standard errors in parentheses; sigma is the weighted residual",
+      "%% standard error, so sigma near 1 means the surface fits to within",
+      "%% the Monte Carlo noise of the simulated quantiles",
+      "\\begin{tabular}{llrrrrr}",
+      "\\toprule",
+      "Test & $N$ & Level & $\\hat\\beta_\\infty$ & $\\hat\\beta_1$ & $\\hat\\beta_2$ & $\\hat\\beta_3$ & $\\hat\\sigma$ \\\\",
+      "\\midrule"
+    )
+    ms <- main_s[main_s$case == case, ]
+    f_ <- function(x) if (is.finite(x)) sprintf("%.3f", x) else ""
+    g_ <- function(x) if (is.finite(x)) sprintf("(%.3f)", x) else ""
+    for (tst in TESTS) for (N in sort(unique(ms$N))) for (p in MAIN_PROBS) {
+      r <- ms[ms$test == tst & ms$N == N & abs(ms$prob - p) < 1e-9, ]
+      if (nrow(r) == 0) next
+      b3 <- if (r$cubic[1]) f_(r$b3[1]) else ""
+      s3 <- if (r$cubic[1]) g_(r$se3[1]) else ""
+      lines2 <- c(lines2,
+        sprintf("\\textit{%s} & %d & %d\\%% & %s & %s & %s & %s & %.2f \\\\",
+                tst, N, round(100 * p), f_(r$beta_inf[1]), f_(r$b1[1]), f_(r$b2[1]), b3, r$sigma[1]),
+        sprintf(" & & & %s & %s & %s & %s & \\\\", g_(r$se_inf[1]), g_(r$se1[1]), g_(r$se2[1]), s3))
+    }
+    lines2 <- c(lines2, "\\bottomrule", "\\end{tabular}")
+    writeLines(lines2, file.path(OUTDIR, sprintf("table42_case-%s.tex", case)))
+  }
+  cat(sprintf("wrote LaTeX tables to %s\n", OUTDIR))
+
+  # ---- 5. worked example of the p-value function ---------------------
+  cat("\nnumerical distribution function, worked example:\n")
+  for (case in unique(surf$case)) {
+    sub <- surf[surf$case == case & surf$N == 1 & surf$test == "GIEG", ]
+    if (nrow(sub) == 0) next
+    ss <- lapply(seq_len(nrow(sub)), function(i) {
+      r <- sub[i, ]
+      list(beta = c(r$beta_inf, r$b1, r$b2, r$b3), se = c(r$se_inf, r$se1, r$se2, r$se3),
+           sigma = r$sigma, cubic = r$cubic, dof = r$dof, nobs = r$nobs)
+    })
+    for (stat in c(-6.505, -5.488)) {
+      pv <- pvalue_from_surface(sub$prob, ss, 140, stat)
+      cat(sprintf("  case %-2s GIEG = %.3f at T = 140 -> p = %.4f\n", case, stat, pv))
+    }
+  }
+  cat("\ndone.\n")
+}
+
+main()
