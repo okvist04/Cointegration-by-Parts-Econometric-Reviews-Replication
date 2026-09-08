@@ -12,6 +12,7 @@
 #   APPLICATION_DATA [../data]   GRAPHICS [../results/graphics]
 #   YEAR_MIN [1880]  YEAR_MAX [2019]
 # =====================================================================
+library(ggplot2)
 
 args <- commandArgs(trailingOnly = FALSE)
 here <- dirname(sub("^--file=", "", args[grep("^--file=", args)][1]))
@@ -26,32 +27,40 @@ tp <- read.csv(file.path(D, "HadCRUT.5.1.0.0.analysis.summary_series.global.annu
 sl$year <- floor(sl$Time); tp$year <- floor(tp$Time)
 base <- mean(tp[["Anomaly (deg C)"]][tp$year >= 1850 & tp$year <= 1900])
 tp$anom <- tp[["Anomaly (deg C)"]] - base
-d <- merge(sl[, c("year", "GMSL (mm)")], tp[, c("year", "anom")], by = "year")
-d <- d[d$year >= YEAR_MIN & d$year <= YEAR_MAX, ]
-names(d)[2] <- "gmsl"
-d <- d[order(d$year), ]
+combined <- merge(sl[, c("year", "GMSL (mm)")], tp[, c("year", "anom")], by = "year")
+names(combined) <- c("year", "sea_level", "temperature")
+combined <- combined[combined$year >= YEAR_MIN & combined$year <= YEAR_MAX, ]
+combined <- combined[order(combined$year), ]
 
-colS <- "#1b6ca8"; colT <- "#b02418"
+# linear rescale of temperature onto sea level's range, purely for
+# display on a shared panel -- the right-hand axis back-transforms to
+# real units, so the apparent closeness of the two lines isn't itself
+# meaningful (a visualization choice, not a result)
+range_sl   <- range(combined$sea_level, na.rm = TRUE)
+range_temp <- range(combined$temperature, na.rm = TRUE)
+rescale_lin <- function(x, from, to) (x - from[1]) / diff(from) * diff(to) + to[1]
+combined$temperature_scaled <- rescale_lin(combined$temperature, range_temp, range_sl)
 
-postscript(file.path(G, "GMST_GMTA.eps"), width = 8.4, height = 4.8,
-           onefile = FALSE, horizontal = FALSE, paper = "special", family = "Helvetica")
-par(mar = c(4.2, 4.4, 1.2, 4.6), mgp = c(2.6, 0.7, 0), cex.axis = 0.9, las = 1, bty = "n")
-plot(NA, xlim = range(d$year), ylim = range(d$gmsl), xlab = "Year", ylab = "Sea level (mm)", axes = FALSE)
-abline(h = pretty(d$gmsl), col = "grey92", lwd = 0.6)
-axis(1); axis(2)
-lines(d$year, d$gmsl, col = colS, lwd = 1.6)
+p_overlay <- ggplot(combined, aes(x = year)) +
+  geom_line(aes(y = sea_level, colour = "Sea level (CSIRO GMSL)")) +
+  geom_line(aes(y = temperature_scaled, colour = "Temperature anomaly (HadCRUT5)")) +
+  scale_y_continuous(
+    name = "Sea level (mm)",
+    sec.axis = sec_axis(
+      transform = ~ rescale_lin(., range_sl, range_temp),
+      name = "Temperature anomaly (degC, 1850-1900 baseline)"
+    )
+  ) +
+  scale_colour_manual(name = NULL, values = c("steelblue", "firebrick")) +
+  labs(
+    x = "Year",
+    title = "Global mean sea level and land-ocean temperature anomaly",
+    subtitle = sprintf("%d-%d, temperature rescaled onto sea level's range for display",
+                        YEAR_MIN, YEAR_MAX)
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 
-# right axis for temperature (linear rescale onto sea level's y-range
-# purely for display -- the vertical alignment matches RANGES, not any
-# principled unit conversion, so visual closeness between the two lines
-# isn't itself meaningful)
-r <- range(d$anom); u <- par("usr")[3:4]
-sc <- function(z) u[1] + (z - r[1]) / diff(r) * diff(u)
-lines(d$year, sc(d$anom), col = colT, lwd = 1.6)
-at <- pretty(r); at <- at[at >= r[1] & at <= r[2]]
-axis(4, at = sc(at), labels = format(at, trim = TRUE))
-mtext(expression("Temperature anomaly (" * degree * "C, 1850-1900 baseline)"), side = 4, line = 3, las = 0, cex = 1.0)
-legend("topleft", legend = c("Sea level (CSIRO GMSL)", "Temperature anomaly (HadCRUT5)"),
-       col = c(colS, colT), lwd = 1.6, bty = "n", cex = 0.85)
-dev.off()
-cat("wrote GMST_GMTA.eps,", YEAR_MIN, "-", YEAR_MAX, "\n")
+ggsave(file.path(G, "GMST_GMTA.eps"), p_overlay, device = cairo_ps,
+       width = 8, height = 6, units = "in")
+cat("wrote", file.path(G, "GMST_GMTA.eps"), "\n")
